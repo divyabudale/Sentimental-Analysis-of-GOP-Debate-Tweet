@@ -1,0 +1,369 @@
+# DATA 650-9040 Assignment 2
+# Written by Divya Budale
+
+#Loading data into R from dashDB
+library(ibmdbR)
+mycon <- idaConnect("BLUDB", "", "")
+idaInit(mycon)
+
+gop <- as.data.frame(ida.data.frame('"DASH9934"."FIRST_GOP_DEBATE"')[ ,c('CANDIDATE', 'CANDIDATE_CONFIDENCE', 'CANDIDATE_GOLD', 'ID', 
+'NAME', 'RELEVANT_YN', 'RELEVANT_YN_CONFIDENCE', 'RELEVANT_YN_GOLD', 'RETWEET_COUNT', 'SENTIMENT', 'SENTIMENT_CONFIDENCE', 'SENTIMENT_GOLD',
+'SUBJECT_MATTER', 'SUBJECT_MATTER_CONFIDENCE', 'SUBJECT_MATTER_GOLD', 'TEXT', 'TWEET_COORD', 'TWEET_CREATED', 'TWEET_ID', 'TWEET_LOCATION', 
+'USER_TIMEZONE')])
+
+
+#Data validation
+dim(gop)
+str(gop)
+View(gop)
+
+#Loading all the packages that are needed
+library(plyr)
+library(arules)
+library(arulesViz)
+library(rpart)
+library(rpart.plot)
+
+#Copy of original data frame was made so as to maintain the untouched version of data file
+df<-gop
+#Records with Null and "No candidate mentioned" in CANDIDATE variable were removed
+df<-df[!is.na(df$CANDIDATE)&df$CANDIDATE!="No candidate mentioned",]
+dim(df)
+
+#Based on the TEXT for the tweet, identify if it is Retweet or not
+df$RETWEETS<-ifelse(grepl('^RT',df$TEXT)==TRUE,1,0)
+df$RETWEETS<-as.factor(df$RETWEETS)
+summary(df$RETWEETS)
+
+#Creation of the STATE variable using TWEET_COORD and TWEET_LOCATION
+#Dataframe of the average latitude and longitude of  each state
+STATE<-c('Alabama','Alaska','Arizona','Arkansas','California','Colorado','Connecticut','Delaware','District of Columbia','Florida','Georgia','Hawaii','Idaho','Illinois','Indiana','Iowa','Kansas','Kentucky','Louisiana','Maine','Maryland','Massachusetts','Michigan','Minnesota','Mississippi','Missouri','Montana','Nebraska','Nevada','New Hampshire','New Jersey','New Mexico','New York','North Carolina','North Dakota','Ohio','Oklahoma','Oregon','Pennsylvania','Rhode Island','South Carolina','South Dakota','Tennessee','Texas','Utah','Vermont','Virginia','Washington','West Virginia','Wisconsin','Wyoming')
+LATITUDE<-c(32.806671,61.370716,33.729759,34.969704,36.116203,39.059811,41.597782,39.318523,38.897438,27.766279,33.040619,21.094318,44.240459,40.349457,39.849426,42.011539,38.5266,37.66814,31.169546,44.693947,39.063946,42.230171,43.326618,45.694454,32.741646,38.456085,46.921925,41.12537,38.313515,43.452492,40.298904,34.840515,42.165726,35.630066,47.528912,40.388783,35.565342,44.572021,40.590752,41.680893,33.856892,44.299782,35.747845,31.054487,40.150032,44.045876,37.769337,47.400902,38.491226,44.268543,42.755966)
+LONGITUDE<-c(-86.79113,-152.404419,-111.431221,-92.373123,-119.681564,-105.311104,-72.755371,-75.507141,-77.026817,-81.686783,-83.643074,-157.498337,-114.478828,-88.986137,-86.258278,-93.210526,-96.726486,-84.670067,-91.867805,-69.381927,-76.802101,-71.530106,-84.536095,-93.900192,-89.678696,-92.288368,-110.454353,-98.268082,-117.055374,-71.563896,-74.521011,-106.248482,-74.948051,-79.806419,-99.784012,-82.764915,-96.928917,-122.070938,-77.209755,-71.51178,-80.945007,-99.438828,-86.692345,-97.563461,-111.862434,-72.710686,-78.169968,-121.490494,-80.954453,-89.616508,-107.30249)
+geocodes<-cbind.data.frame(STATE,LATITUDE,LONGITUDE)
+geocodes$STATE<-as.character(geocodes$STATE)
+
+#Dataframe of the state code and state name
+CODE<-c('AK','AL','AR','AS','AZ','CA','CO','CT','DC','DE','FL','GA','GU','HI','IA','ID','IL','IN','KS','KY','LA','MA','MD','ME','MI','MN','MO','MP','MS','MT','NA','NC','ND','NE','NH','NJ','NM','NV','NY','OH','OK','OR','PA','PR','RI','SC','SD','TN','TX','UT','VA','VI','VT','WA','WI','WV','WY')
+NAME<-c('ALASKA','ALABAMA','ARKANSAS','AMERICAN SAMOA','ARIZONA','CALIFORNIA','COLORADO','CONNECTICUT','DISTRICT OF COLUMBIA','DELAWARE','FLORIDA','GEORGIA','GUAM','HAWAII','IOWA','IDAHO','ILLINOIS','INDIANA','KANSAS','KENTUCKY','LOUISIANA','MASSACHUSETTS','MARYLAND','MAINE','MICHIGAN','MINNESOTA','MISSOURI','NORTHERN MARIANA ISLANDS','MISSISSIPPI','MONTANA','NATIONAL','NORTH CAROLINA','NORTH DAKOTA','NEBRASKA','NEW HAMPSHIRE','NEW JERSEY','NEW MEXICO','NEVADA','NEW YORK','OHIO','OKLAHOMA','OREGON','PENNSYLVANIA','PUERTO RICO','RHODE ISLAND','SOUTH CAROLINA','SOUTH DAKOTA','TENNESSEE','TEXAS','UTAH','VIRGINIA','VIRGIN ISLANDS','VERMONT','WASHINGTON','WISCONSIN','WEST VIRGINIA','WYOMING')
+statecodes<-cbind.data.frame(CODE,NAME)
+statecodes$CODE<-as.character(statecodes$CODE)
+statecodes$NAME<-as.character(statecodes$NAME)
+
+#Function to determine the state using either coordinate or location
+determine_state<-function(rec) {
+if(!is.na(rec['TWEET_COORD'])) {
+	st<-state_coord(rec)}
+else(st<-state_location(rec))
+return(st)
+}
+
+state_coord<-function(rec) {
+coord<-unlist(regmatches(rec['TWEET_COORD'], gregexpr("\\[\\K[^\\]]+(?=\\])", rec['TWEET_COORD'], perl=TRUE)))
+lat<-as.numeric(unlist(strsplit(coord,","))[1])
+long<-as.numeric(unlist(strsplit(coord,","))[2])
+states<-trimws(geocodes$STATE)
+state=''
+dist=0
+for(st in states) {
+	lat_st<-geocodes[geocodes$STATE==st,]$LATITUDE
+	long_st<-geocodes[geocodes$STATE==st,]$LONGITUDE	
+	cdist<-calculate_distance(lat,long,lat_st,long_st)
+	if(state=='' | dist > cdist) {
+	dist=cdist
+	state=st	
+	}	
+}
+return(toupper(state))
+}
+
+calculate_distance<-function(lat1,lon1,lat2,lon2) {
+p=(pi/180)
+lat1=as.double(lat1)*p
+lon1=as.double(lon1)*p
+lat2=as.double(lat2)*p
+lon2=as.double(lon2)*p	
+R=6372.797 #mean radius of Earth in km
+dlat = lat2 - lat1
+dlon = lon2 - lon1
+a = sin(dlat / 2) * sin(dlat / 2) + cos(lat1) * cos(lat2) * sin(dlon / 2) * sin(dlon / 2)
+c = 2 * atan2(sqrt(a), sqrt(1 - a))
+dist = R * c        
+return(dist)        	
+}
+
+state_location<-function(rec) {
+st<-(unlist(strsplit(rec['TWEET_LOCATION'],",")))[2]
+st<-trimws(toupper(st),which="both")
+st_code<-statecodes$CODE
+st_NAME<-statecodes$NAME
+if(st %in% st_code) {
+	st<-statecodes[statecodes$CODE==st,]$NAME
+}
+else if(st %in% st_NAME) {
+	st<-st
+}
+     else( st<-"" )   
+return(st)
+}
+
+#Pass the entire data frame into the function and replace the empty values with "NOT AVAILABLE"
+df$STATE<-apply(df,1,determine_state)
+df[df$STATE=="",]$STATE<-"NOT AVAILABLE"
+df$STATE<-as.factor(df$STATE)
+#Remove TWEET_COORD and TWEET_LOCATION
+df$TWEET_COORD<-NULL
+df$TWEET_LOCATION<-NULL
+
+summary(df$STATE)
+
+#Creation of datatime variable from TWEET_CREATED
+df$CREATION_TIME<-as.POSIXct(substr(df$TWEET_CREATED,1,19),"%m/%d/%y %H:%M:%S")
+#Extract only dates and times into two different variables
+df$DATES<-substr(df$CREATION_TIME,9,10)
+df$TIMES<-substr(df$CREATION_TIME,12,19)
+#Grouping of the TIMES variable into 3 groups based on the value
+df[df$TIMES>"18:00:00"&df$TIMES<="23:59:00",]$TIMES<-"A"
+df[df$TIMES>="00:00:00"&df$TIMES<="06:59:00",]$TIMES<-"B"
+df[df$TIMES>"06:59:00"&df$TIMES<="10:59:00",]$TIMES<-"C"
+df$DATES<-as.factor(df$DATES)
+df$TIMES<-as.factor(df$TIMES)
+#Remove TWEET_CREATED and CREATION_TIME
+df$TWEET_CREATED<-NULL
+df$CREATION_TIME<-NULL
+
+summary(df$DATES)
+summary(df$TIMES)
+
+#Factoring CANDIDATE_CONFIDENCE, SUBJECT_MATTER_CONFIDENCE, SENTIMENT_CONFIDENCE into 3 groups
+#whereas RELEVANT_YN_CONFIDENCE into 2 groups based on the values
+df$CANDIDATE_CONFIDENCE<-as.numeric(df$CANDIDATE_CONFIDENCE)
+df[df$CANDIDATE_CONFIDENCE>0.7&df$CANDIDATE_CONFIDENCE<=1.0000,]$CANDIDATE_CONFIDENCE<-3
+df[df$CANDIDATE_CONFIDENCE>0.4&df$CANDIDATE_CONFIDENCE<=0.7,]$CANDIDATE_CONFIDENCE<-2
+df[df$CANDIDATE_CONFIDENCE>=0.1&df$CANDIDATE_CONFIDENCE<=0.4,]$CANDIDATE_CONFIDENCE<-1
+df$CANDIDATE_CONFIDENCE<-as.factor(df$CANDIDATE_CONFIDENCE)
+
+df$SUBJECT_MATTER_CONFIDENCE<-as.numeric(df$SUBJECT_MATTER_CONFIDENCE)
+df[df$SUBJECT_MATTER_CONFIDENCE>0.7&df$SUBJECT_MATTER_CONFIDENCE<=1.0000,]$SUBJECT_MATTER_CONFIDENCE<-3
+df[df$SUBJECT_MATTER_CONFIDENCE>0.4&df$SUBJECT_MATTER_CONFIDENCE<=0.7,]$SUBJECT_MATTER_CONFIDENCE<-2
+df[df$SUBJECT_MATTER_CONFIDENCE>=0.1&df$SUBJECT_MATTER_CONFIDENCE<=0.4,]$SUBJECT_MATTER_CONFIDENCE<-1
+df$SUBJECT_MATTER_CONFIDENCE<-as.factor(df$SUBJECT_MATTER_CONFIDENCE)
+
+df$SENTIMENT_CONFIDENCE<-as.numeric(df$SENTIMENT_CONFIDENCE)
+df[df$SENTIMENT_CONFIDENCE>0.7&df$SENTIMENT_CONFIDENCE<=1.0000,]$SENTIMENT_CONFIDENCE<-3
+df[df$SENTIMENT_CONFIDENCE>0.4&df$SENTIMENT_CONFIDENCE<=0.7,]$SENTIMENT_CONFIDENCE<-2
+df[df$SENTIMENT_CONFIDENCE>=0.1&df$SENTIMENT_CONFIDENCE<=0.4,]$SENTIMENT_CONFIDENCE<-1
+df$SENTIMENT_CONFIDENCE<-as.factor(df$SENTIMENT_CONFIDENCE)
+
+df$RELEVANT_YN_CONFIDENCE<-as.numeric(df$RELEVANT_YN_CONFIDENCE)
+df[df$RELEVANT_YN_CONFIDENCE>0.7&df$RELEVANT_YN_CONFIDENCE<=1.0000,]$RELEVANT_YN_CONFIDENCE<-3
+df[df$RELEVANT_YN_CONFIDENCE>0.4&df$RELEVANT_YN_CONFIDENCE<=0.7,]$RELEVANT_YN_CONFIDENCE<-2
+df$RELEVANT_YN_CONFIDENCE<-as.factor(df$RELEVANT_YN_CONFIDENCE)
+
+summary(df$CANDIDATE_CONFIDENCE)
+summary(df$SUBJECT_MATTER_CONFIDENCE)
+summary(df$SENTIMENT_CONFIDENCE)
+summary(df$RELEVANT_YN_CONFIDENCE)
+
+
+#Factoring RETWEET_COUNT as either 1 or 0 based on the count
+df$RETWEET_COUNT<-as.numeric(df$RETWEET_COUNT)
+df[df$RETWEET_COUNT>=1,]$RETWEET_COUNT<-1
+df$RETWEET_COUNT<-as.factor(df$RETWEET_COUNT)
+summary(df$RETWEET_COUNT)
+
+#Replacing the null values in TIMEZONE with None and then factoring it
+df[is.na(df$USER_TIMEZONE),]$USER_TIMEZONE<-"NONE"
+df$USER_TIMEZONE<-as.factor(df$USER_TIMEZONE)
+
+#Convert SENTIMENT, CANDIDATE and SUBJECT_MATTER into factors 
+df$SENTIMENT<-as.factor(df$SENTIMENT)
+df$CANDIDATE<-as.factor(df$CANDIDATE)
+df[is.na(df$SUBJECT_MATTER),]$SUBJECT_MATTER<-"None of the above"
+df$SUBJECT_MATTER<-as.factor(df$SUBJECT_MATTER)
+
+#Remove TEXT, TWEET_ID and NAME from the analysis
+df$TEXT<-NULL
+df$TWEET_ID<-NULL
+df$NAME<-NULL
+
+#Determine if the RELEVANT_YN, RELEVANT_YN_GOLD, SENTIMENT_GOLD, SUBJECT_MATTER_GOLD, CANDIDATE_GOLD can be used for analysis
+summary(as.factor(df$RELEVANT_YN))
+summary(as.factor(df$RELEVANT_YN_GOLD))
+summary(as.factor(df$SENTIMENT_GOLD))
+summary(as.factor(df$SUBJECT_MATTER_GOLD))
+summary(as.factor(df$CANDIDATE_GOLD))
+
+#Remove RELEVANT_YN, RELEVANT_YN_GOLD, SENTIMENT_GOLD, SUBJECT_MATTER_GOLD, CANDIDATE_GOLD from the analysis
+df$RELEVANT_YN<-NULL
+df$RELEVANT_YN_GOLD<-NULL
+df$SENTIMENT_GOLD<-NULL
+df$SUBJECT_MATTER_GOLD<-NULL
+df$CANDIDATE_GOLD<-NULL
+
+#########################################################################################################
+#Part1
+#Creation of data frame for candidate,sentiment and count
+sent_cand<-data.frame(table(df$CANDIDATE,df$SENTIMENT))
+names(sent_cand)[1]<-"CANDIDATE"
+names(sent_cand)[2]<-"SENTIMENT"
+names(sent_cand)[3]<-"FREQ"
+
+#Plot for Tweets for Candidates by each Sentiment
+ggplot(sent_cand,aes(x=reorder(CANDIDATE,FREQ),y=FREQ,fill=CANDIDATE))+geom_bar(stat="Identity")+
+facet_wrap(~SENTIMENT, ncol = 3, scales = "free")+
+theme(axis.title.x=element_blank(),axis.title.y=element_blank(),axis.text.x = element_text(angle=45,hjust = 1))+
+labs(title="Tweets for Candidates by each Sentiment")+theme(legend.position="none",plot.title=element_text(color="Blue"))
+
+
+#Plot for roportion of Tweets by Sentiment for each Candidate
+ggplot(sent_cand,aes(x=reorder(CANDIDATE,FREQ),y=FREQ,fill=SENTIMENT))+geom_bar(stat="Identity")+
+theme(axis.title.x=element_blank(),axis.title.y=element_blank(),axis.text.x = element_text(angle=45,hjust = 1))+
+labs(title="Proportion of Tweets by Sentiment for each Candidate")+theme(plot.title=element_text(color="Blue"))
+
+#Plot for Tweets for Sentiment stacked by Candidate
+ggplot(sent_cand,aes(x=reorder(SENTIMENT,FREQ),y=FREQ,fill=CANDIDATE))+geom_bar(stat="Identity",colour="black")+
+theme(axis.title.x=element_blank(),axis.title.y=element_blank(),axis.text.x = element_text(angle=45,hjust = 1))+
+labs(title="Tweets for Sentiment stacked by Candidate")+theme(plot.title=element_text(color="Blue"))+
+scale_fill_brewer(palette = "Paired")
+
+#Creation of dataframe for Number of Tweets, Non-retweeted Tweets, Retweets, Negative, Positive, Neutal,
+#percentage of negative, positive and neutral tweets, net positive tweets and retweet to non-retweeted tweet ratio
+TWEETS<-ddply(df,~CANDIDATE,summarize,TWEETS=length(ID))
+ORIGINAL<-ddply(df,~CANDIDATE,summarize,ORIGINAL=length(ID[RETWEETS==0]))
+RETWEETS<-ddply(df,~CANDIDATE,summarize,RETWEETS=length(ID[RETWEETS==1]))
+NEGATIVE<-ddply(df,~CANDIDATE,summarize,NEGATIVE=length(ID[SENTIMENT=="Negative"]))
+POSITIVE<-ddply(df,~CANDIDATE,summarize,POSITIVE=length(ID[SENTIMENT=="Positive"]))
+NEUTRAL<-ddply(df,~CANDIDATE,summarize,NEUTRAL=length(ID[SENTIMENT=="Neutral"]))
+ts<-cbind(TWEETS,ORIGINAL,RETWEETS,NEGATIVE,POSITIVE,NEUTRAL)
+ts<-ts[,c(1,2,4,6,8,10,12)]
+ts$PERCENT_NEGATIVE<-round((ts$NEGATIVE/ts$TWEETS)*100,1)
+ts$PERCENT_POSITIVE<-round((ts$POSITIVE/ts$TWEETS)*100,1)
+ts$PERCENT_NEUTRAL<-round((ts$NEUTRAL/ts$TWEETS)*100,1)
+ts$NETPOS<-ts$POSITIVE-ts$NEGATIVE
+ts$RETWEETRATIO<-round(ts$RETWEETS/ts$ORIGINAL,1)
+
+
+#Plot for Most Negative to Positive tweets by Candidate
+NETPOS<-ts[,c("CANDIDATE","NETPOS")]
+ggplot(NETPOS, aes(x=reorder(CANDIDATE,NETPOS),y=NETPOS, fill=CANDIDATE))+geom_bar(stat="Identity")+
+theme(axis.title.x=element_blank(),axis.title.y=element_blank(),axis.text.x = element_text(angle=45,hjust = 1))+
+labs(title="Most Negative to Positive tweets by Candidate")+theme(legend.position="none",plot.title=element_text(color="Blue"))
+
+
+#Plot for  Most Retweets by Original Ratio by Candidate
+RETWEETRATIO<-ts[,c("CANDIDATE","RETWEETRATIO")]
+ggplot(RETWEETRATIO, aes(x=reorder(CANDIDATE,RETWEETRATIO),y=RETWEETRATIO, fill=CANDIDATE))+geom_bar(stat="Identity")+
+theme(axis.title.x=element_blank(),axis.title.y=element_blank(),axis.text.x = element_text(angle=45,hjust = 1))+
+labs(title="Most Retweets by Original Ratio by Candidate")+
+theme(legend.position="none",plot.title=element_text(color="Blue"))
+
+
+#Part2
+#Creation of dataframe for Candidate, subject matter and count by excluding the null, None of the above and FOX News or Moderators values in SUBJECT_MATTER
+subj_df<-df
+ex_subj<-c("None of the above","FOX News or Moderators")
+subj_df<-subj_df[!is.na(subj_df$SUBJECT_MATTER) & !subj_df$SUBJECT_MATTER %in% (ex_subj),]
+subj_matter<-data.frame(table(subj_df$CANDIDATE,subj_df$SUBJECT_MATTER))
+names(subj_matter)[1]<-"CANDIDATE"
+names(subj_matter)[2]<-"SUBJECT_MATTER"
+names(subj_matter)[3]<-"FREQ"
+subj_matter<-subj_matter[subj_matter$FREQ>0,]
+
+#Plot for Candidate Proportion for each Subject Matter 
+ggplot(subj_matter,aes(x=reorder(SUBJECT_MATTER,FREQ),y=FREQ,fill=CANDIDATE))+geom_bar(stat = "Identity")+
+theme(axis.title.x=element_blank(),axis.title.y=element_blank(),axis.text.x = element_text(angle=45,hjust = 1))+
+labs(title="Candidate Proportion for each Subject Matter")+
+theme(plot.title=element_text(color="Blue"))+scale_fill_brewer(palette = "Paired")
+
+#Plot for Sentiments for each Candidate by Subject Matter
+ss<-ddply(subj_df,.(SUBJECT_MATTER,CANDIDATE,SENTIMENT),summarise,FREQ=length((ID)))
+ggplot(ss,aes(x=reorder(SENTIMENT,FREQ),y=FREQ,fill=CANDIDATE))+geom_bar(stat="Identity")+
+facet_wrap(~SUBJECT_MATTER,ncol=5)+
+theme(axis.title.x=element_blank(),axis.title.y=element_blank(),axis.text.x = element_text(angle=45,hjust = 1))+
+labs(title="Sentiments for each Candidate by Subject Matter")+
+theme(plot.title=element_text(color="Blue"))
+
+#Candidates who did not get any tweets for a subject matter  
+subj_matter$CANDIDATE<-as.character(subj_matter$CANDIDATE)
+subj_matter$SUBJECT_MATTER<-as.character(subj_matter$SUBJECT_MATTER)
+sub=list()
+for(i in unique(subj_matter$SUBJECT_MATTER)) {
+     x<-unique(subj_matter[subj_matter$SUBJECT_MATTER==i ,]$CANDIDATE)
+     #print(x)
+     mat<-unique(subj_matter[!subj_matter$CANDIDATE %in% x,]$CANDIDATE)
+     #print(mat)
+     mat[i]<-ifelse(identical(mat,character(0))==TRUE,"All",mat[i])
+     subj<-i
+     sub[[i]]<-cbind(subj,mat) 
+}
+final<-data.frame(do.call(rbind,sub))
+final<-final[!is.na(final$mat),]
+
+#Part3
+#Creation of the dataframe for State, Sentiment and count
+state_sent<-data.frame(table(df$STATE,df$SENTIMENT))
+names(state_sent)[1]<-"STATE"
+names(state_sent)[2]<-"SENTIMENT"
+names(state_sent)[3]<-"FREQ"
+#Remove the records with state value = "NOT AVAILABLE"
+state_sent<-state_sent[state_sent$STATE!="NOT AVAILABLE",]
+
+#Plot for Sentiments by State
+ggplot(state_sent,aes(x=reorder(STATE,FREQ),y=FREQ,fill=SENTIMENT))+geom_bar(stat="Identity")+
+theme(axis.title.x=element_blank(),axis.title.y=element_blank(),axis.text.x = element_text(angle=45,hjust = 1))+
+labs(title="Sentiments by State")+theme(plot.title=element_text(color="Blue"))
+
+#######################################################################################################
+#Association rule analysis
+
+#Remove ID from the analysis
+df$ID<-NULL
+
+#Default apriori command for all the conditions
+rules_all<-apriori(df)
+
+#Apriori algorithm for Negative Sentiment
+rules<-apriori(df,parameter=list(supp=0.2,conf=0.6),appearance=list(rhs=c("SENTIMENT=Negative"),default="lhs"))
+#Pruning of redundant rules
+rules.sorted<-sort(rules, by="lift")
+subset.matrix<-is.subset(rules.sorted, rules.sorted)
+subset.matrix[lower.tri(subset.matrix, diag=T)]<-NA
+redundant<-colSums(subset.matrix, na.rm=T)>=1
+rules.pruned<-rules.sorted[!redundant]
+summary(rules.pruned)
+inspect(rules.pruned)
+#Plotting the rules with grouped method
+plot(rules.pruned, method="grouped")
+
+#Apriori algorithm for Positive Sentiment  and pruning of redundant rules
+rules<-apriori(df,parameter=list(supp=0.1,conf=0.1),appearance=list(rhs=c("SENTIMENT=Positive"),default="lhs"))
+rules.sorted<-sort(rules, by="lift")
+subset.matrix<-is.subset(rules.sorted, rules.sorted)
+subset.matrix[lower.tri(subset.matrix, diag=T)]<-NA
+redundant<-colSums(subset.matrix, na.rm=T)>=1
+rules.pruned<-rules.sorted[!redundant]
+summary(rules.pruned)
+inspect(rules.pruned)
+#Plotting the rules with graph method
+plot(rules.pruned, method="grouped")
+
+#################################################################
+#Decision Tree Analysis
+set.seed(1234)
+ind<-sample(2,nrow(df),replace=TRUE,prob=c(0.7,0.3))
+train.data<-df[ind==1,]
+test.data<-df[ind==2,]
+tree<-rpart(RETWEETS~CANDIDATE+CANDIDATE_CONFIDENCE+RELEVANT_YN_CONFIDENCE+
+		     SENTIMENT+SENTIMENT_CONFIDENCE+
+		     SUBJECT_MATTER+SUBJECT_MATTER_CONFIDENCE+
+		     DATES+TIMES,data=train.data,method="class")
+#print the tree
+tree		     
+#Plotting the tree
+rpart.plot(tree,type=4,faclen=2,cex=0.7)
+#Prediction on test data
+retweet_predict <- predict(tree,newdata=test.data,type="class")
+table(retweet_predict, test.data$RETWEETS)
+
+
